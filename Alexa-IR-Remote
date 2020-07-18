@@ -1,0 +1,227 @@
+#include <Arduino.h>
+#ifdef ESP32
+    #include <WiFi.h>
+#else
+    #include <ESP8266WiFi.h>
+#endif
+#include "fauxmoESP.h"
+#include <IRremoteESP8266.h>
+#include <IRsend.h>
+#include <IRrecv.h>
+#include <IRac.h>
+#include <IRtext.h>
+#include <IRutils.h>
+#include <ir_Fujitsu.h>
+
+#define WIFI_SSID "..." // Please Enter you Wifi name here
+#define WIFI_PASS "..." // Enter password here
+
+fauxmoESP fauxmo;
+
+// -----------------------------------------------------------------------------
+
+#define SERIAL_BAUDRATE     115200
+
+// As this program is a special purpose capture/decoder, let us use a larger
+// than normal buffer so we can handle Air Conditioner remote codes.
+#define CAPTURE_BUFFER_SIZE 1024
+
+// Timeout is the Nr. of milli-Seconds of no-more-data before we consider a
+// message ended.
+#define TIMEOUT             50
+
+// Set higher if you get lots of random short UNKNOWN messages when nothing
+// should be sending a message.
+// Set lower if you are sure your setup is working, but it doesn't see messages
+// from your device. (e.g. Other IR remotes work.)
+#define MIN_UNKOWN_SIZE     12
+
+#define IR_RECEIVER         5
+#define IR_LED              4
+
+IRrecv irrecv(IR_RECEIVER, CAPTURE_BUFFER_SIZE, TIMEOUT, true);
+decode_results results;  // Somewhere to store the results
+IRFujitsuAC ac(IR_LED);
+IRsend irsend(IR_LED);
+
+#define ID_AC "AC"
+#define ID_TV "TV"
+
+bool isTVPowered = false;
+
+String samsungPowerHEX = "0xE0E040BF";
+uint16_t rawDataSamsungPower[203] = {4506, 4512,  540, 1714,  540, 1718,  520, 1714,
+                                     540, 588,  520, 584,  546, 582,  522, 588,  542,
+                                     582,  542, 1718,  520, 1714,  542, 1718,  520, 584,
+                                     544, 586,  520, 586,  542, 582,  538, 592,  520,
+                                     584,  544, 1716,  522, 584,  546, 584,  520, 588,
+                                     542, 582,  542, 586,  522, 584,  546, 1712,  520,
+                                     586,  544, 1712,  520, 1716,  544, 1714,  520, 1718,
+                                     544, 1712,  516, 1722,  542, 46820,  4504, 4512,
+                                     540, 1714,  540, 1720,  520, 1712,  542, 588,  520,
+                                     584,  546, 582,  520, 586,  542, 584,  542, 1718,
+                                     520, 1714,  540, 1720,  520, 584,  544, 584,  520,
+                                     588,  542, 584,  538, 592,  520, 582,  544, 1716,
+                                     520, 584,  544, 584,  520, 586,  544, 582,  542,
+                                     588,  520, 584,  544, 1714,  520, 588,  542, 1714,
+                                     520, 1718,  542, 1712,  520, 1718,  542, 1714, 
+                                     520, 1718,  542, 46818,  4504, 4512,  540, 1714,  
+                                     540, 1720,  520, 1714,  540, 590,  520, 586,  546,
+                                     582,  518, 588,  542, 582,  540, 1720,  520, 1714,
+                                     540, 1720,  518, 584,  544, 586,  518, 588,  542, 
+                                     584,  538, 592,  520, 584,  544, 1716,  518, 586, 
+                                     546, 582,  518, 588,  542, 584,  542, 590,  518, 
+                                     586,  542, 1716,  518, 588,  542, 1714,  520, 1718,
+                                     544, 1714,  518, 1720,  542, 1714,  518, 1718,  544};
+
+
+// -----------------------------------------------------------------------------
+
+// -----------------------------------------------------------------------------
+// AC
+// -----------------------------------------------------------------------------
+
+void acSetup() {
+    ac.begin();
+    Serial.println("Setting desired state for A/C.");
+    // See `fujitsu_ac_remote_model_t` in `ir_Fujitsu.h` for a list of models.
+    ac.setModel(ARRAH2E);
+    ac.setSwing(kFujitsuAcSwingOff);
+    ac.setMode(kFujitsuAcModeCool);
+    ac.setFanSpeed(kFujitsuAcFanAuto);
+    ac.setTemp(24);
+    ac.setCmd(kFujitsuAcCmdTurnOn);
+}
+
+// -----------------------------------------------------------------------------
+// Wifi
+// -----------------------------------------------------------------------------
+
+void wifiSetup() {
+
+    // Set WIFI module to STA mode
+    WiFi.mode(WIFI_STA);
+
+    // Connect
+    Serial.printf("[WIFI] Connecting to %s ", WIFI_SSID);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+    // Wait
+    while (WiFi.status() != WL_CONNECTED) {
+        Serial.print(".");
+        delay(100);
+    }
+    Serial.println();
+
+    // Connected!
+    Serial.printf("[WIFI] STATION Mode, SSID: %s, IP address: %s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+
+}
+
+void setup() {
+
+    // Init serial port and clean garbage
+    Serial.begin(SERIAL_BAUDRATE);
+    Serial.println();
+    Serial.println();
+
+    // Wifi
+    wifiSetup();
+
+    // AC
+    acSetup();
+
+    // IRSend
+    irsend.begin();
+
+    #if DECODE_HASH
+      // Ignore messages with less than minimum on or off pulses.
+      irrecv.setUnknownThreshold(MIN_UNKOWN_SIZE);
+    #endif  // DECODE_HASH
+    irrecv.enableIRIn();  // Start the receiver
+
+    // By default, fauxmoESP creates it's own webserver on the defined port
+    // The TCP port must be 80 for gen3 devices (default is 1901)
+    // This has to be done before the call to enable()
+    fauxmo.createServer(true); // not needed, this is the default value
+    fauxmo.setPort(80); // This is required for gen3 devices
+
+    // You have to call enable(true) once you have a WiFi connection
+    // You can enable or disable the library at any moment
+    // Disabling it will prevent the devices from being discovered and switched
+    fauxmo.enable(true);
+
+    // You can use different ways to invoke alexa to modify the devices state:
+    // "Alexa, turn yellow lamp on"
+    // "Alexa, turn on yellow lamp
+    // "Alexa, set yellow lamp to fifty" (50 means 50% of brightness, note, this example does not use this functionality)
+
+    // Add virtual devices
+    fauxmo.addDevice(ID_AC);
+    fauxmo.addDevice(ID_TV);
+
+    fauxmo.onSetState([](unsigned char device_id, const char * device_name, bool state, unsigned char value) {
+        
+        // Callback when a command from Alexa is received. 
+        // You can use device_id or device_name to choose the element to perform an action onto (relay, LED,...)
+        // State is a boolean (ON/OFF) and value a number from 0 to 255 (if you say "set kitchen light to 50%" you will receive a 128 here).
+        // Just remember not to delay too much here, this is a callback, exit as soon as possible.
+        // If you have to do something more involved here set a flag and process it in your main loop.
+        
+        Serial.printf("[MAIN] Device #%d (%s) state: %s value: %d\n", device_id, device_name, state ? "ON" : "OFF", value);
+
+        // Checking for device_id is simpler if you are certain about the order they are loaded and it does not change.
+        // Otherwise comparing the device_name is safer.
+
+        if (strcmp(device_name, ID_AC)==0) {
+          state ? ac.on() : ac.off();
+          ac.send();
+        } else if (strcmp(device_name, ID_TV)==0) {
+          // On command and TV is off
+          if (state && !isTVPowered) {
+            // Disable IR recive while sending IR 
+            irrecv.disableIRIn();
+            irsend.sendRaw(rawDataSamsungPower, 203, 38);   // Send a raw data capture at 38kHz.
+            isTVPowered = true;
+            // Enable IR recive 
+            irrecv.enableIRIn();
+                        
+          // Off command and TV is on
+          } else if (!state && isTVPowered) {
+            // Disable IR recive while sending IR 
+            irrecv.disableIRIn();
+            irsend.sendRaw(rawDataSamsungPower, 203, 38);   // Send a raw data capture at 38kHz.
+            isTVPowered = false; 
+            // Enable IR recive 
+            irrecv.enableIRIn();
+          }
+
+          // Report status to Alexa
+          fauxmo.setState(ID_TV, isTVPowered, 255);
+        }
+    });
+}
+
+void loop() {
+
+    // fauxmoESP uses an async TCP server but a sync UDP server
+    // Therefore, we have to manually poll for UDP packets
+    fauxmo.handle();
+
+    // If remote power off/on detected report it to Alexa
+    if (irrecv.decode(&results)) {
+      if(resultToHexidecimal(&results).equals(samsungPowerHEX)) {
+        isTVPowered = !isTVPowered;
+        fauxmo.setState(ID_TV, isTVPowered, 255);
+      }
+    }
+
+    // This is a sample code to output free heap every 5 seconds
+    // This is a cheap way to detect memory leaks
+    static unsigned long last = millis();
+    if (millis() - last > 5000) {
+        last = millis();
+        Serial.printf("[MAIN] Free heap: %d bytes\n", ESP.getFreeHeap());
+    }
+
+}
